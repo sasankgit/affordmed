@@ -293,3 +293,57 @@ where n.notificationType = 'Placement'
 ```
 
 `distinct` is there because a student could have received multiple placement notifications in that window and we only want them listed once.
+
+
+---
+
+## Stage 4
+
+### the problem
+
+Every page load hits the database directly to fetch notifications. With 50,000 students doing this throughout the day — and especially during placement season when everyone's refreshing constantly — the database gets overwhelmed pretty quickly. The fix isn't one single thing, it's a few layers working together.
+
+### caching with redis
+
+The most impactful change is putting Redis in front of the database. The first time a student loads their notifications, we fetch from the DB and store the result in Redis with a key like `notifications:studentId:1042`. Every subsequent page load reads from Redis instead of hitting the database at all.
+
+When a new notification comes in for that student, we invalidate their cache key so the next fetch goes back to the DB and refreshes it.
+
+The tradeoff is that students could briefly see slightly stale data in the window between a new notification arriving and the cache being invalidated. This is usually fine for a notification system where a second or two of delay doesn't matter. The bigger risk is cache invalidation bugs — if you forget to invalidate on any write path, students see outdated data until TTL expires.
+
+A reasonable TTL is around 60 seconds as a safety net even if invalidation is handled correctly.
+
+### pagination
+
+Already built into Stage 1 but worth calling out here. Fetching 20 notifications at a time instead of all of them cuts the data transferred per request significantly. It also means the DB query is cheaper because of the LIMIT clause. The partial index from Stage 3 helps here too since it makes those paginated unread queries fast.
+
+The tradeoff is minimal — just slightly more complexity on the frontend to handle page numbers.
+
+### push over polling
+
+The deeper fix is what we already designed in Stage 1 — WebSockets. If the server pushes new notifications to the client the moment they're created, the client doesn't need to poll on every page load at all. The unread count badge updates in real time without a single extra DB read.
+
+This removes an entire category of unnecessary reads. A student sitting on the notifications page doesn't keep firing GET requests — they just wait and receive.
+
+The tradeoff is that WebSocket connections are stateful and consume memory on the server for every connected client. At 50,000 concurrent students this needs horizontal scaling with a shared pub/sub layer like Redis so all WebSocket server instances can broadcast to any connected student.
+
+### read replicas
+
+Route all SELECT queries to read replicas and keep writes on the primary. This is straightforward with most PostgreSQL setups and multiplies your read capacity by however many replicas you add.
+
+The tradeoff is replication lag — replicas might be a few milliseconds behind the primary. For a notification system this is almost always acceptable. The only edge case is if a student marks something as read and immediately refreshes, they might briefly see it as unread if that read hits a lagging replica. This can be handled by routing a user's own write-then-read to the primary for a short window.
+
+### http caching headers
+
+For the notifications API, return `Cache-Control` and `ETag` headers. The browser stores the response and on the next request sends an `If-None-Match` header with the ETag. If nothing changed, the server returns a 304 with no body and the browser uses its cached version. No DB query needed at all for unchanged data.
+
+```
+Cache-Control: private, max-age=30
+ETag: "abc123hashofresponse"
+```
+
+The tradeoff is this only works for GET requests and requires computing and comparing ETags on the server side. It's also only useful for clients that respect HTTP caching, which browsers do but some mobile implementations might not.
+
+### what to actually do
+
+In practice, the combination that makes the most sense is redis caching + pagination + read replicas. WebSocket push is already there from Stage 1 and handles the real-time side. HTTP caching is a nice bonus on top. No single strategy is enough on its own — the DB relief comes from layering these together.
