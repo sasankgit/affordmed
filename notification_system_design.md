@@ -347,3 +347,89 @@ The tradeoff is this only works for GET requests and requires computing and comp
 ### what to actually do
 
 In practice, the combination that makes the most sense is redis caching + pagination + read replicas. WebSocket push is already there from Stage 1 and handles the real-time side. HTTP caching is a nice bonus on top. No single strategy is enough on its own — the DB relief comes from layering these together.
+
+
+
+
+---
+
+## Stage 5
+
+### what's wrong with the original implementation
+
+The core issue is that everything is synchronous and sequential. For each student, the code calls `send_email`, waits for it to finish, then calls `save_to_db`, waits, then calls `push_to_app`. This happens one student at a time across 50,000 students.
+
+A few problems with this:
+
+the HR who clicked "Notify All" is now waiting for all 50,000 to finish before getting any response. That could be minutes.
+
+if `send_email` throws an error halfway through — say at student number 5,000 — the loop either crashes or skips everyone after that. The remaining 45,000 students get nothing and there's no way to know where it stopped.
+
+there's no retry logic anywhere. a transient email API failure is treated the same as a permanent one — the notification just doesn't go out.
+
+all three operations are tightly coupled. if the email succeeds but the DB insert fails, we've sent an email for a notification that doesn't exist in the system. if the push fails, we have no way to retry just the push.
+
+### what happened with the 200 failed emails
+
+with the original code, there's no record of which students didn't get their email. you'd have to rerun the whole thing and risk sending duplicates to the 49,800 who already got it. this is the worst case scenario for a bulk notification system.
+
+the only way to handle this properly is to have each job tracked individually with its own status, so failed ones can be retried in isolation without touching the ones that already succeeded.
+
+### redesigned approach
+
+the fix is to stop doing this synchronously and push everything into a queue.
+
+`notify_all` should do one thing — create the notification record in the DB and enqueue a job for each student. it returns immediately. separate workers running in parallel pick up the jobs and handle the actual delivery.
+
+email, DB insert, and in-app push should be separate concerns. each one can fail and retry independently without affecting the others.
+
+```
+function notify_all(student_ids: array, message: string):
+    notification_id = save_notification_to_db(message)  # single insert, not per student
+
+    for student_id in student_ids in batches of 500:
+        enqueue_job(queue="notifications", payload={
+            student_id: student_id,
+            notification_id: notification_id,
+            message: message
+        })
+
+    return { status: "queued", total: len(student_ids) }
+
+
+worker function process_notification_job(job):
+    student_id = job.student_id
+    notification_id = job.notification_id
+    message = job.message
+
+    try:
+        save_student_notification_to_db(student_id, notification_id)  # fan-out insert
+    except error:
+        log(error)
+        retry(job, max_attempts=3)
+        return
+
+    try:
+        send_email(student_id, message)
+    except error:
+        log(error)
+        enqueue_job(queue="email_retry", payload=job, delay=30s)  # retry separately
+
+    try:
+        push_to_app(student_id, message)
+    except error:
+        log(error)
+        enqueue_job(queue="push_retry", payload=job, delay=10s)  # retry separately
+```
+
+with this setup, `notify_all` returns in milliseconds. the queue fans out the work to however many workers are running in parallel. if an email fails for 200 students, those 200 jobs go into a retry queue with their student IDs recorded — nothing else is affected and no one gets a duplicate.
+
+### should DB save and email happen in the same transaction?
+
+no, they shouldn't.
+
+the DB insert is the source of truth. once it's saved, the notification exists in the system regardless of what happens with email or push. if you tie the DB insert to the email call in one transaction, a failed email rolls back the insert — the student never gets the in-app notification either, and the notification doesn't exist anywhere in the system. that's worse than just a failed email.
+
+the right model is: save to DB first, always. then treat email and push as side effects that run independently and can be retried without touching the DB record. if the email fails, the in-app notification is still there. if the push fails, the student can still see it when they open the app. nothing is lost.
+
+this also makes idempotency easier — each worker job can check if it already processed a given `(student_id, notification_id)` pair before doing anything, which prevents duplicates on retry.
