@@ -13,13 +13,12 @@ function score(notification) {
 }
 
 export function getTopN(notifications, n = 10) {
-  // min-heap approach — keep only top n by score
   const heap = [];
 
   const heapPush = (item) => {
     heap.push(item);
-    heap.sort((a, b) => a.score - b.score); // keep sorted ascending (min at front)
-    if (heap.length > n) heap.shift(); // remove smallest
+    heap.sort((a, b) => a.score - b.score);
+    if (heap.length > n) heap.shift();
   };
 
   for (const notif of notifications) {

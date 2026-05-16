@@ -1,6 +1,3 @@
-// tracks which notification IDs have been read, stored in memory
-// persists across page navigations within the same session using localStorage
-
 const STORAGE_KEY = "read_notifications";
 
 function getReadSet() {
@@ -16,7 +13,6 @@ function saveReadSet(set) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify([...set]));
   } catch {
-    // silently fail if storage is unavailable
   }
 }
 

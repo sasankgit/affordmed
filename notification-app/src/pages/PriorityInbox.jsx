@@ -56,9 +56,6 @@ export default function PriorityInbox() {
               Priority Inbox
             </Typography>
           </Box>
-          <Typography variant="body2" color="text.secondary">
-            {"Placement > Result > Event · Sorted by importance and recency"}
-          </Typography>
         </Box>
 
         <FormControl size="small" sx={{ minWidth: 150 }}>
